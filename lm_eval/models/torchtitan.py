@@ -15,11 +15,8 @@ from tqdm import tqdm
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from lm_eval.models.utils import (
-    Collator,
-    pad_and_concat,
-    stop_sequences_criteria,
-)
+from lm_eval.models.utils import Collator
+from lm_eval.models.utils_hf import pad_and_concat
 
 eval_logger = logging.getLogger(__name__)
 
@@ -53,6 +50,8 @@ class TorchTitanLM(TemplateLM):
         device: Optional[str] = "cuda",
         batch_size: Optional[Union[int, str]] = 1,
         dtype: Optional[Union[str, torch.dtype]] = torch.bfloat16,
+        model_overrides: Optional[dict] = None,
+        moe_overrides: Optional[dict] = None,
         **kwargs,
     ) -> None:
         """
@@ -67,6 +66,8 @@ class TorchTitanLM(TemplateLM):
             device: Device to load model on
             batch_size: Batch size for evaluation
             dtype: Model dtype (default: bfloat16)
+            model_overrides: Dict of model config overrides (e.g., {"custom_moe_impl": "virtual_group", "is_moe_list": [False, True, ...]})
+            moe_overrides: Dict of MoE config overrides (e.g., {"num_experts": 128, "route_scale": 2})
         """
 
         super().__init__()
@@ -78,6 +79,8 @@ class TorchTitanLM(TemplateLM):
         self._device = torch.device(device if device else "cuda")
         self._batch_size = int(batch_size) if isinstance(batch_size, str) else batch_size
         self._dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        self.model_overrides = model_overrides or {}
+        self.moe_overrides = moe_overrides or {}
 
         # Set backend to causal (decoder-only)
         self.backend = "causal"
@@ -140,9 +143,59 @@ class TorchTitanLM(TemplateLM):
             )
 
         model_args = configs[self.model_flavor]
+
+        # Apply model overrides (following update_from_config pattern in args.py)
+        if self.model_overrides:
+            eval_logger.info(f"Applying model overrides: {self.model_overrides}")
+            for key, value in self.model_overrides.items():
+                if value is not None:
+                    # Handle special case for is_moe_list which might be passed as string
+                    if key == "is_moe_list" and isinstance(value, str):
+                        # Evaluate string representation of list
+                        import ast
+                        value = ast.literal_eval(value)
+
+                    # Handle n_moe_layers convenience field (from custom_args.py)
+                    if key == "n_moe_layers":
+                        if value > model_args.n_layers - 1:
+                            raise ValueError(
+                                f"n_moe_layers={value} must be <= n_layers-1={model_args.n_layers-1}"
+                            )
+                        model_args.is_moe_list = (
+                            (model_args.n_layers - value - 1) * [False]
+                            + value * [True]
+                            + [False]
+                        )
+                        eval_logger.info(f"  Set is_moe_list from n_moe_layers={value}")
+                    elif hasattr(model_args, key):
+                        setattr(model_args, key, value)
+                        eval_logger.info(f"  Set {key} = {value}")
+                    else:
+                        eval_logger.warning(f"  Unknown model arg: {key}")
+
+        # Apply MoE overrides (following update_from_config pattern in args.py)
+        if self.moe_overrides and hasattr(model_args, 'moe_args'):
+            eval_logger.info(f"Applying MoE overrides: {self.moe_overrides}")
+            for key, value in self.moe_overrides.items():
+                if value is not None and hasattr(model_args.moe_args, key):
+                    setattr(model_args.moe_args, key, value)
+                    eval_logger.info(f"  Set moe_args.{key} = {value}")
+                elif value is not None:
+                    eval_logger.warning(f"  Unknown MoE arg: {key}")
+
+        # Validate is_moe_list length (from args.py lines 97-103)
+        if (
+            getattr(model_args, "is_moe_list", None) is not None
+            and len(model_args.is_moe_list) != model_args.n_layers
+        ):
+            raise ValueError(
+                f"is_moe_list must be None or have {model_args.n_layers} elements. "
+                f"Got {len(model_args.is_moe_list)} elements."
+            )
+
         self.model_args = model_args
 
-        eval_logger.info(f"Model config: {model_args}")
+        eval_logger.info(f"Final model config: {model_args}")
 
         # Initialize model on meta device (following train.py pattern)
         with torch.device("meta"):
@@ -437,9 +490,6 @@ class TorchTitanLM(TemplateLM):
             List of total log-likelihoods for each request
         """
         from lm_eval import utils
-
-
-        breakpoint()
 
         loglikelihoods = []
 
