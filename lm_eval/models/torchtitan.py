@@ -114,8 +114,6 @@ class TorchTitanLM(TemplateLM):
                     llama3_moe_configs,
                     Llama3MoEStateDictAdapter,
                 )
-                from torchtitan.components.checkpoint import CheckpointManager, ModelWrapper
-                from torchtitan.config import TORCH_DTYPE_MAP
 
                 model_cls = Llama3MoE
                 configs = llama3_moe_configs
