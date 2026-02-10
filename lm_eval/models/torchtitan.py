@@ -36,6 +36,10 @@ class TorchTitanLM(TemplateLM):
         lm_eval --model torchtitan \
                 --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer \
                 --tasks hellaswag
+
+        lm_eval --model torchtitan \
+                --model_args "model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer,model_overrides={'custom_moe_impl':'virtual_group','n_moe_layers':14,'moe_inter_dim':4096},moe_overrides={'num_experts':128,'route_scale':2,'hf_ffn_hidden_dim':8192}" \
+                --tasks hellaswag
     """
 
     _DEFAULT_MAX_LENGTH = 2048
