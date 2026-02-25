@@ -297,11 +297,146 @@ class TorchTitanLM(TemplateLM):
             logits = self._model(inps)
             return logits
 
+    def _debug_test_generation(self):
+        """
+        Debug method to test model generation capability.
+        Generates 64 tokens for the prompt "What is the capital of France?"
+        and prints the output before exiting.
+        """
+        import sys
+
+        eval_logger.info("=" * 80)
+        eval_logger.info("DEBUG: Testing model generation capability")
+        eval_logger.info("=" * 80)
+
+        # Create test prompt
+        test_prompt = "The key to life is"
+        eval_logger.info(f"Test prompt: {test_prompt}")
+
+        # Tokenize prompt
+        prompt_tokens = self.tok_encode(test_prompt)
+        eval_logger.info(f"Prompt tokens: {prompt_tokens}")
+        eval_logger.info(f"Prompt length: {len(prompt_tokens)} tokens")
+
+        # Convert to tensor
+        context_tensor = torch.tensor(
+            prompt_tokens, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        # Generate 64 tokens
+        max_new_tokens = 64
+        eos_token_id = self.tokenizer.eos_token_id
+
+        eval_logger.info(f"Generating {max_new_tokens} tokens...")
+
+        generated_tokens = []
+        current_context = context_tensor
+
+        for step in range(max_new_tokens):
+            with torch.no_grad():
+                # Check context length vs freqs_cis
+                eval_logger.info(f"Step {step}: Context length: {current_context.shape[1]}, freqs_cis length: {self._model.freqs_cis.shape[0]}")
+
+                logits = self._model(current_context)
+
+                # Log logits statistics at each step
+                logits_last = logits[:, -1, :]
+                top5_tokens = torch.topk(logits_last, k=5, dim=-1)
+                top5_token_ids = top5_tokens.indices[0].tolist()
+                top5_logits = top5_tokens.values[0].tolist()
+
+                # Decode top-5 tokens for readability
+                top5_decoded = [self.tok_decode([tid]) for tid in top5_token_ids]
+
+                eval_logger.info(f"Step {step}: Top-5 token IDs: {top5_token_ids}")
+                eval_logger.info(f"Step {step}: Top-5 tokens: {top5_decoded}")
+                eval_logger.info(f"Step {step}: Top-5 logits: {[f'{v:.4f}' for v in top5_logits]}")
+
+                # Greedy decoding
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                eval_logger.info(f"Step {step}: Selected token ID: {next_token.item()}, decoded: '{self.tok_decode([next_token.item()])}'")
+
+                current_context = torch.cat([current_context, next_token], dim=1)
+                generated_tokens.append(next_token.item())
+
+                # Stop if EOS token is generated
+                if next_token.item() == eos_token_id:
+                    eval_logger.info(f"EOS token generated at step {step}")
+                    break
+
+        # Decode full output (prompt + generation)
+        full_output = self.tok_decode(current_context[0].tolist())
+
+        # Decode only generated part
+        generated_text = self.tok_decode(generated_tokens)
+
+        eval_logger.info("=" * 80)
+        eval_logger.info("GREEDY DECODING RESULTS:")
+        eval_logger.info("=" * 80)
+        eval_logger.info("FULL OUTPUT (prompt + generation):")
+        eval_logger.info("-" * 80)
+        print(full_output)
+        eval_logger.info("-" * 80)
+        eval_logger.info("GENERATED TEXT (generation only):")
+        eval_logger.info("-" * 80)
+        print(generated_text)
+        eval_logger.info("-" * 80)
+        eval_logger.info(f"Generated {len(generated_tokens)} tokens")
+        eval_logger.info("=" * 80)
+
+        # Now try with temperature sampling
+        eval_logger.info("\n" + "=" * 80)
+        eval_logger.info("TESTING WITH TEMPERATURE SAMPLING (temperature=0.8)")
+        eval_logger.info("=" * 80)
+
+        # Reset context
+        context_tensor = torch.tensor(
+            prompt_tokens, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        generated_tokens_temp = []
+        current_context_temp = context_tensor
+
+        for step in range(min(max_new_tokens, 20)):  # Only 20 tokens for temperature test
+            with torch.no_grad():
+                logits = self._model(current_context_temp)
+
+                # Temperature sampling
+                temperature = 0.8
+                probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+                eval_logger.info(f"Temp step {step}: Selected token ID: {next_token.item()}, decoded: '{self.tok_decode([next_token.item()])}'")
+
+                current_context_temp = torch.cat([current_context_temp, next_token], dim=1)
+                generated_tokens_temp.append(next_token.item())
+
+                if next_token.item() == eos_token_id:
+                    eval_logger.info(f"EOS token generated at step {step}")
+                    break
+
+        generated_text_temp = self.tok_decode(generated_tokens_temp)
+        eval_logger.info("-" * 80)
+        eval_logger.info("TEMPERATURE SAMPLING OUTPUT:")
+        eval_logger.info("-" * 80)
+        print(generated_text_temp)
+        eval_logger.info("-" * 80)
+        eval_logger.info("=" * 80)
+
+        # Exit the program
+        eval_logger.info("DEBUG: Exiting program after generation test")
+        sys.exit(0)
+
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         """
         Generate text using simple greedy decoding. Implement
         basic greedy generation.
         """
+        # DEBUG: Test generation on first call
+        # if not hasattr(self, '_debug_test_done'):
+        #     self._debug_test_done = True
+        #     self._debug_test_generation()
+
         max_new_tokens = generation_kwargs.get("max_new_tokens", self.max_gen_toks)
         eos_token_id = self.tokenizer.eos_token_id
 
