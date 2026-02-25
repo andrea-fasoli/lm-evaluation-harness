@@ -10,6 +10,7 @@ The `torchtitan.py` module provides a custom model adapter that enables evaluati
 - **No HuggingFace Dependency**: Does not inherit from HFLM; implements custom model initialization
 - **MoE Support**: Specifically designed for Llama3 MoE architectures
 - **Evaluation-Optimized**: Simplified checkpoint loading (model weights only, no optimizer/scheduler state)
+- **Data Parallelism Support**: Multi-GPU evaluation via HuggingFace Accelerate for improved throughput
 
 ## Architecture
 
@@ -84,7 +85,7 @@ From `torchtitan/models/llama3_moe/__init__.py`:
 
 ### Example Commands
 
-#### Evaluate 1B Model on Multiple Tasks
+#### Single GPU Evaluation
 
 ```bash
 lm_eval --model torchtitan \
@@ -93,6 +94,18 @@ lm_eval --model torchtitan \
         --batch_size 8 \
         --device cuda
 ```
+
+#### Multi-GPU Evaluation with Data Parallelism (4 GPUs)
+
+```bash
+accelerate launch --num_processes=4 \
+        -m lm_eval --model torchtitan \
+        --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/checkpoints/llama3_moe_1B,tokenizer_path=/tokenizers/llama3 \
+        --tasks hellaswag,arc_easy,arc_challenge \
+        --batch_size 8
+```
+
+**Note**: With data parallelism, each GPU processes a subset of evaluation requests in parallel, providing ~4x throughput improvement with 4 GPUs.
 
 #### Evaluate with Custom Max Length
 
@@ -303,19 +316,20 @@ if tokenizer.pad_token is None:
 
 ### Current Limitations
 
-1. **Single Device Only**: No distributed evaluation support (unlike training)
-2. **Greedy Decoding Only**: No sampling, temperature, or nucleus sampling
-3. **No Quantization**: Full precision only (bfloat16/float32)
-4. **MoE Only**: Currently only supports `llama3_moe` architecture
-5. **No Attention Mask**: TorchTitan models don't use attention masks
+1. **Greedy Decoding Only**: No sampling, temperature, or nucleus sampling
+2. **No Quantization**: Full precision only (bfloat16/float32)
+3. **MoE Only**: Currently only supports `llama3_moe` architecture
+4. **No Attention Mask**: TorchTitan models don't use attention masks
+5. **No Model Parallelism**: Data parallelism only (model must fit on single GPU)
 
 ### Planned Enhancements
 
-1. **Multi-GPU Support**: Add data parallelism for faster evaluation
-2. **Advanced Generation**: Implement sampling strategies
-3. **More Architectures**: Support standard Llama3 (non-MoE)
-4. **Quantization**: Add int8/int4 quantization support
-5. **Attention Mask**: Add optional attention mask support for padding
+1. **Tensor Parallelism**: Add TP for memory-efficient inference of large models
+2. **Expert Parallelism**: Add EP for MoE-specific optimization
+3. **Advanced Generation**: Implement sampling strategies
+4. **More Architectures**: Support standard Llama3 (non-MoE)
+5. **Quantization**: Add int8/int4 quantization support
+6. **Attention Mask**: Add optional attention mask support for padding
 
 ## Troubleshooting
 
@@ -376,33 +390,113 @@ RuntimeError: Failed to load tokenizer
 --model_args tokenizer_path=/path/to/tokenizer
 ```
 
+## Data Parallelism Support
+
+### Overview
+
+TorchTitanLM now supports **data parallelism** via HuggingFace Accelerate, enabling multi-GPU evaluation for improved throughput.
+
+### How It Works
+
+- **Model Replication**: Each GPU gets a full copy of the model
+- **Request Sharding**: Evaluation requests are automatically distributed across GPUs
+- **Result Gathering**: Results are collected from all processes at the end
+- **Linear Scaling**: 4 GPUs provide ~4x throughput improvement
+
+### Setup
+
+1. **Install Accelerate** (if not already installed):
+```bash
+pip install accelerate
+```
+
+2. **Launch with Accelerate**:
+```bash
+accelerate launch --num_processes=4 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/ckpt \
+    --tasks hellaswag
+```
+
+### Configuration
+
+You can configure Accelerate with a config file:
+
+```bash
+# Create config
+accelerate config
+
+# Or use command-line args
+accelerate launch \
+    --num_processes=4 \
+    --num_machines=1 \
+    --mixed_precision=bf16 \
+    --dynamo_backend=no \
+    -m lm_eval --model torchtitan --model_args ...
+```
+
+### DCP Checkpoint Compatibility
+
+**Good news**: DCP checkpoints work seamlessly with data parallelism!
+
+- **DCP** handles checkpoint format and loading
+- **DDP** handles runtime parallelism
+- They are orthogonal and compatible
+- Each GPU loads the full model from the (potentially sharded) DCP checkpoint
+- DCP automatically assembles sharded weights into the full model
+
+### Performance Expectations
+
+| GPUs | Throughput Multiplier | Notes |
+|------|----------------------|-------|
+| 1 | 1x (baseline) | Single GPU evaluation |
+| 2 | ~2x | Linear scaling |
+| 4 | ~4x | Linear scaling |
+| 8 | ~8x | Linear scaling (if model fits) |
+
+**Important**: Each GPU must have enough memory to hold the full model. For memory-efficient parallelism, use Tensor Parallelism (TP) instead.
+
+### Comparison: Data Parallelism vs Tensor Parallelism
+
+| Feature | Data Parallelism (DDP) | Tensor Parallelism (TP) |
+|---------|------------------------|-------------------------|
+| **Memory per GPU** | Full model | 1/N of model |
+| **Throughput** | N× improvement | Similar to single GPU |
+| **Communication** | Minimal (results only) | High (activations) |
+| **Setup** | Easy (Accelerate) | Complex (device mesh) |
+| **Best for** | Throughput, small models | Large models, memory-bound |
+| **Currently Supported** | ✅ Yes | ❌ Not yet (planned) |
+
 ## Performance Considerations
 
 ### Memory Usage
 
 Approximate GPU memory requirements (bfloat16):
 
-| Model Flavor | Parameters | GPU Memory (Eval) |
-|--------------|------------|-------------------|
-| debugmodel_8exp | ~1M | <1 GB |
-| 1B | ~1B | ~4 GB |
-| 3B | ~3B | ~8 GB |
-| 8B | ~8B | ~20 GB |
+| Model Flavor | Parameters | GPU Memory (Eval) | Recommended GPUs (DDP) |
+|--------------|------------|-------------------|------------------------|
+| debugmodel_8exp | ~1M | <1 GB | 1 |
+| 1B | ~1B | ~4 GB | 1-4 |
+| 3B | ~3B | ~8 GB | 1-4 |
+| 8B | ~8B | ~20 GB | 1-2 (A100 40GB) |
 
 ### Batch Size Recommendations
 
-| Model Size | Recommended Batch Size | Max Sequence Length |
-|------------|------------------------|---------------------|
-| 1B | 8-16 | 2048 |
-| 3B | 4-8 | 2048 |
-| 8B | 1-4 | 2048 |
+| Model Size | Single GPU Batch Size | Multi-GPU (4x) Batch Size | Max Sequence Length |
+|------------|----------------------|---------------------------|---------------------|
+| 1B | 8-16 | 8-16 per GPU | 2048 |
+| 3B | 4-8 | 4-8 per GPU | 2048 |
+| 8B | 1-4 | 1-4 per GPU | 2048 |
+
+**Note**: With data parallelism, batch size is per-GPU. Total effective batch size = batch_size × num_processes.
 
 ### Optimization Tips
 
 1. **Use bfloat16**: Default dtype, good balance of speed and accuracy
-2. **Batch Evaluation**: Increase batch_size for throughput
-3. **Truncate Sequences**: Set appropriate max_length for your tasks
-4. **Cache Results**: lm-eval automatically caches results
+2. **Enable Data Parallelism**: Use `accelerate launch` for multi-GPU throughput
+3. **Batch Evaluation**: Increase batch_size for throughput
+4. **Truncate Sequences**: Set appropriate max_length for your tasks
+5. **Cache Results**: lm-eval automatically caches results
 
 ## Code Examples
 

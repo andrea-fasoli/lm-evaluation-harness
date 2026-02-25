@@ -6,6 +6,7 @@ Enables evaluation of TorchTitan models by loading native DCP checkpoints.
 
 import logging
 import os
+from datetime import timedelta
 from typing import Any, Optional, Union
 
 import torch
@@ -32,11 +33,21 @@ class TorchTitanLM(TemplateLM):
     - Checkpoint format (DCP, not safetensors)
     - Configuration system (no config.json)
 
+    Supports data parallelism via HuggingFace Accelerate for multi-GPU evaluation.
+
     Usage:
+        # Single GPU evaluation
         lm_eval --model torchtitan \
                 --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer \
                 --tasks hellaswag
 
+        # Multi-GPU evaluation with data parallelism (4 GPUs)
+        accelerate launch --num_processes=4 \
+                -m lm_eval --model torchtitan \
+                --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer \
+                --tasks hellaswag
+
+        # With model overrides
         lm_eval --model torchtitan \
                 --model_args "model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer,model_overrides={'custom_moe_impl':'virtual_group','n_moe_layers':14,'moe_inter_dim':4096},moe_overrides={'num_experts':128,'route_scale':2,'hf_ffn_hidden_dim':8192}" \
                 --tasks hellaswag
@@ -80,7 +91,6 @@ class TorchTitanLM(TemplateLM):
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path or checkpoint_path
         self._max_length = max_length or self._DEFAULT_MAX_LENGTH
-        self._device = torch.device(device if device else "cuda")
         self._batch_size = int(batch_size) if isinstance(batch_size, str) else batch_size
         self._dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
         self.model_overrides = model_overrides or {}
@@ -88,6 +98,36 @@ class TorchTitanLM(TemplateLM):
 
         # Set backend to causal (decoder-only)
         self.backend = "causal"
+
+        # Initialize Accelerate for data parallelism support
+        # This enables multi-GPU evaluation when launched with `accelerate launch`
+        try:
+            from accelerate import Accelerator, InitProcessGroupKwargs
+
+            accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+            accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+
+            if accelerator.num_processes > 1:
+                self.accelerator = accelerator
+                self._rank = accelerator.local_process_index
+                self._world_size = accelerator.num_processes
+                self._device = accelerator.device
+                eval_logger.info(
+                    f"Data parallelism enabled: {self._world_size} processes, "
+                    f"rank {self._rank}, device {self._device}"
+                )
+            else:
+                # Single process mode
+                self._rank = 0
+                self._world_size = 1
+                self._device = torch.device(device if device else "cuda")
+                eval_logger.info(f"Single process mode, using device: {self._device}")
+        except ImportError:
+            # Accelerate not available, fall back to single process
+            eval_logger.info("Accelerate not available, using single process mode")
+            self._rank = 0
+            self._world_size = 1
+            self._device = torch.device(device if device else "cuda")
 
         # Initialize model and tokenizer
         self._create_model()
