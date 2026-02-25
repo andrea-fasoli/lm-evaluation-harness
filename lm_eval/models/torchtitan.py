@@ -33,7 +33,11 @@ class TorchTitanLM(TemplateLM):
     - Checkpoint format (DCP, not safetensors)
     - Configuration system (no config.json)
 
-    Supports data parallelism via HuggingFace Accelerate for multi-GPU evaluation.
+    Supports multiple parallelization strategies:
+    - Data Parallelism (DDP) via HuggingFace Accelerate
+    - Tensor Parallelism (TP) for memory-efficient inference
+    - Expert Parallelism (EP) for MoE models
+    - Hybrid EP+TP for maximum efficiency
 
     Usage:
         # Single GPU evaluation
@@ -41,10 +45,28 @@ class TorchTitanLM(TemplateLM):
                 --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer \
                 --tasks hellaswag
 
-        # Multi-GPU evaluation with data parallelism (4 GPUs)
+        # Multi-GPU with data parallelism (4 GPUs, model replicated)
         accelerate launch --num_processes=4 \
                 -m lm_eval --model torchtitan \
                 --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tokenizer_path=/path/to/tokenizer \
+                --tasks hellaswag
+
+        # Tensor Parallelism (4 GPUs, model sharded)
+        torchrun --nproc_per_node=4 \
+                -m lm_eval --model torchtitan \
+                --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tp_degree=4 \
+                --tasks hellaswag
+
+        # Expert Parallelism (8 GPUs, experts distributed)
+        torchrun --nproc_per_node=8 \
+                -m lm_eval --model torchtitan \
+                --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,ep_degree=8 \
+                --tasks hellaswag
+
+        # Hybrid TP+EP (8 GPUs: 2-way TP, 4-way EP)
+        torchrun --nproc_per_node=8 \
+                -m lm_eval --model torchtitan \
+                --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/checkpoint,tp_degree=2,ep_degree=4,enable_ep_tp=True \
                 --tasks hellaswag
 
         # With model overrides
@@ -67,6 +89,10 @@ class TorchTitanLM(TemplateLM):
         dtype: Optional[Union[str, torch.dtype]] = torch.bfloat16,
         model_overrides: Optional[dict] = None,
         moe_overrides: Optional[dict] = None,
+        # Parallelism options
+        tp_degree: int = 1,
+        ep_degree: int = 1,
+        enable_ep_tp: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -78,11 +104,14 @@ class TorchTitanLM(TemplateLM):
             checkpoint_path: Path to TorchTitan DCP checkpoint directory
             tokenizer_path: Path to tokenizer directory
             max_length: Maximum sequence length
-            device: Device to load model on
+            device: Device to load model on (ignored if using parallelism)
             batch_size: Batch size for evaluation
             dtype: Model dtype (default: bfloat16)
             model_overrides: Dict of model config overrides (e.g., {"custom_moe_impl": "virtual_group", "is_moe_list": [False, True, ...]})
             moe_overrides: Dict of MoE config overrides (e.g., {"num_experts": 128, "route_scale": 2})
+            tp_degree: Tensor parallelism degree (default: 1, no TP)
+            ep_degree: Expert parallelism degree (default: 1, no EP)
+            enable_ep_tp: Enable hybrid EP+TP parallelism (default: False)
         """
 
         super().__init__()
@@ -96,11 +125,123 @@ class TorchTitanLM(TemplateLM):
         self.model_overrides = model_overrides or {}
         self.moe_overrides = moe_overrides or {}
 
+        # Store parallelism configuration
+        self.tp_degree = tp_degree
+        self.ep_degree = ep_degree
+        self.enable_ep_tp = enable_ep_tp
+
         # Set backend to causal (decoder-only)
         self.backend = "causal"
 
-        # Initialize Accelerate for data parallelism support
-        # This enables multi-GPU evaluation when launched with `accelerate launch`
+        # Determine parallelism strategy
+        self.use_model_parallel = (tp_degree > 1 or ep_degree > 1)
+
+        if self.use_model_parallel:
+            # Model parallelism (TP/EP) - requires torch.distributed
+            self._init_model_parallelism()
+        else:
+            # Try data parallelism via Accelerate
+            self._init_data_parallelism(device)
+
+        # Initialize model and tokenizer
+        self._create_model()
+        self._create_tokenizer()
+
+        eval_logger.info(f"TorchTitanLM initialized: {model_name}/{model_flavor}")
+
+    def _init_model_parallelism(self) -> None:
+        """Initialize model parallelism (TP/EP) using torch.distributed."""
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+
+        self._rank = torch.distributed.get_rank()
+        self._world_size = torch.distributed.get_world_size()
+
+        # Validate world size matches parallelism configuration
+        expected_world_size = self.tp_degree * self.ep_degree
+        if self._world_size != expected_world_size:
+            raise ValueError(
+                f"World size ({self._world_size}) does not match "
+                f"tp_degree ({self.tp_degree}) * ep_degree ({self.ep_degree}) = {expected_world_size}"
+            )
+
+        # Create device mesh for model parallelism
+        from torch.distributed.device_mesh import init_device_mesh
+
+        if self.tp_degree > 1 and self.ep_degree > 1:
+            # 2D mesh: (ep, tp)
+            self.device_mesh = init_device_mesh(
+                "cuda",
+                (self.ep_degree, self.tp_degree),
+                mesh_dim_names=("ep", "tp")
+            )
+            eval_logger.info(
+                f"Model parallelism enabled: TP={self.tp_degree}, EP={self.ep_degree}, "
+                f"rank={self._rank}/{self._world_size}, 2D mesh"
+            )
+        elif self.tp_degree > 1:
+            # 1D mesh: tp only
+            self.device_mesh = init_device_mesh(
+                "cuda",
+                (self.tp_degree,),
+                mesh_dim_names=("tp",)
+            )
+            eval_logger.info(
+                f"Tensor parallelism enabled: TP={self.tp_degree}, "
+                f"rank={self._rank}/{self._world_size}"
+            )
+        elif self.ep_degree > 1:
+            # 1D mesh: ep only
+            self.device_mesh = init_device_mesh(
+                "cuda",
+                (self.ep_degree,),
+                mesh_dim_names=("ep",)
+            )
+            eval_logger.info(
+                f"Expert parallelism enabled: EP={self.ep_degree}, "
+                f"rank={self._rank}/{self._world_size}"
+            )
+
+        self._device = torch.device(f"cuda:{self._rank}")
+
+        # Create a minimal accelerator-like object for compatibility with lm-eval
+        # This provides the gather() method needed by the evaluator
+        self.accelerator = self._create_minimal_accelerator()
+
+    def _create_minimal_accelerator(self):
+        """Create a minimal accelerator-like object for lm-eval compatibility."""
+        class MinimalAccelerator:
+            def __init__(self, rank, world_size, device):
+                self.local_process_index = rank
+                self.num_processes = world_size
+                self.device = device
+
+            def gather(self, tensor):
+                """Gather tensors from all ranks using torch.distributed."""
+                if not torch.distributed.is_initialized():
+                    return tensor
+
+                # Ensure tensor is on the correct device
+                if not tensor.is_cuda:
+                    tensor = tensor.to(self.device)
+
+                # Gather from all ranks
+                world_size = torch.distributed.get_world_size()
+                gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(gathered_tensors, tensor)
+
+                # Stack into single tensor
+                return torch.stack(gathered_tensors)
+
+            def wait_for_everyone(self):
+                """Synchronize all processes using a barrier."""
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+
+        return MinimalAccelerator(self._rank, self._world_size, self._device)
+
+    def _init_data_parallelism(self, device: Optional[str]) -> None:
+        """Initialize data parallelism via Accelerate."""
         try:
             from accelerate import Accelerator, InitProcessGroupKwargs
 
@@ -128,12 +269,6 @@ class TorchTitanLM(TemplateLM):
             self._rank = 0
             self._world_size = 1
             self._device = torch.device(device if device else "cuda")
-
-        # Initialize model and tokenizer
-        self._create_model()
-        self._create_tokenizer()
-
-        eval_logger.info(f"TorchTitanLM initialized: {model_name}/{model_flavor}")
 
     def _create_model(self) -> None:
         """
@@ -243,6 +378,10 @@ class TorchTitanLM(TemplateLM):
         with torch.device("meta"):
             self._model = model_cls(model_args)
 
+        # Apply model parallelism BEFORE materializing weights
+        if self.use_model_parallel:
+            self._apply_model_parallelism()
+
         # Move to device and initialize weights
         self._model.to_empty(device=self._device)
         with torch.no_grad():
@@ -266,6 +405,56 @@ class TorchTitanLM(TemplateLM):
         torch.set_grad_enabled(False)
 
         eval_logger.info(f"Model loaded successfully on {self._device}")
+
+    def _apply_model_parallelism(self) -> None:
+        """Apply TP/EP parallelism to the model using torchtitan functions."""
+        eval_logger.info("Applying model parallelism...")
+
+        # Import parallelization functions from torchtitan
+        try:
+            from torchtitan.experiments.llama4.infra.parallelize import (
+                apply_moe_ep_tp,
+                apply_non_moe_tp,
+            )
+        except ImportError:
+            raise ImportError(
+                "Failed to import torchtitan parallelization functions. "
+                "Ensure torchtitan is installed with llama4 experiments."
+            )
+
+        # Determine which meshes to use
+        tp_mesh = self.device_mesh["tp"] if self.tp_degree > 1 else None
+        ep_mesh = self.device_mesh["ep"] if self.ep_degree > 1 else None
+        ep_tp_mesh = None
+
+        if self.tp_degree > 1 and self.ep_degree > 1:
+            ep_tp_mesh = self.device_mesh["ep", "tp"] if self.enable_ep_tp else None
+
+        # Apply TP to non-MoE layers
+        if tp_mesh is not None:
+            eval_logger.info(f"Applying Tensor Parallelism (TP={self.tp_degree})...")
+            apply_non_moe_tp(
+                self._model,
+                tp_mesh,
+                loss_parallel=False,  # No loss parallelism for inference
+                enable_float8_tensorwise_tp=False,
+            )
+
+        # Apply EP/TP to MoE layers
+        if tp_mesh is not None or ep_mesh is not None:
+            eval_logger.info(
+                f"Applying MoE parallelism (TP={self.tp_degree}, EP={self.ep_degree}, "
+                f"EP+TP={self.enable_ep_tp})..."
+            )
+            apply_moe_ep_tp(
+                self._model,
+                tp_mesh=tp_mesh,
+                ep_mesh=ep_mesh,
+                ep_tp_mesh=ep_tp_mesh,
+                etp_enabled=self.enable_ep_tp,
+            )
+
+        eval_logger.info("Model parallelism applied successfully")
 
     def _load_checkpoint(
         self,

@@ -390,82 +390,206 @@ RuntimeError: Failed to load tokenizer
 --model_args tokenizer_path=/path/to/tokenizer
 ```
 
-## Data Parallelism Support
+## Parallelization Strategies
 
-### Overview
+TorchTitanLM supports multiple parallelization strategies for efficient multi-GPU inference:
 
-TorchTitanLM now supports **data parallelism** via HuggingFace Accelerate, enabling multi-GPU evaluation for improved throughput.
+### 1. Data Parallelism (DDP) - For Throughput
 
-### How It Works
+**Overview**: Replicate model across GPUs, shard evaluation requests.
 
-- **Model Replication**: Each GPU gets a full copy of the model
-- **Request Sharding**: Evaluation requests are automatically distributed across GPUs
-- **Result Gathering**: Results are collected from all processes at the end
-- **Linear Scaling**: 4 GPUs provide ~4x throughput improvement
+**How It Works**:
+- Each GPU gets a full copy of the model
+- Evaluation requests automatically distributed across GPUs
+- Results collected from all processes at the end
+- Linear scaling: 4 GPUs = ~4x throughput
 
-### Setup
-
-1. **Install Accelerate** (if not already installed):
+**Setup**:
 ```bash
+# Install Accelerate
 pip install accelerate
-```
 
-2. **Launch with Accelerate**:
-```bash
+# Launch with 4 GPUs
 accelerate launch --num_processes=4 \
     -m lm_eval --model torchtitan \
     --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/ckpt \
     --tasks hellaswag
 ```
 
-### Configuration
+**Pros**: Easy setup, linear throughput scaling
+**Cons**: Each GPU needs full model memory
+**Best for**: Models that fit on single GPU, maximizing throughput
 
-You can configure Accelerate with a config file:
+---
 
+### 2. Tensor Parallelism (TP) - For Memory Efficiency
+
+**Overview**: Shard model weights across GPUs, each GPU computes portion of operations.
+
+**How It Works**:
+- Model weights split across GPUs (column-wise/row-wise)
+- Attention and FFN layers sharded
+- All-reduce communication for activations
+- Memory per GPU = Model size / TP degree
+
+**Setup**:
 ```bash
-# Create config
-accelerate config
-
-# Or use command-line args
-accelerate launch \
-    --num_processes=4 \
-    --num_machines=1 \
-    --mixed_precision=bf16 \
-    --dynamo_backend=no \
-    -m lm_eval --model torchtitan --model_args ...
+# 4-way Tensor Parallelism
+torchrun --nproc_per_node=4 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=3B,checkpoint_path=/path/to/ckpt,tp_degree=4 \
+    --tasks hellaswag
 ```
+
+**Pros**: Reduces memory per GPU, enables larger models
+**Cons**: Communication overhead, similar throughput to single GPU
+**Best for**: Large models that don't fit on single GPU
+
+---
+
+### 3. Expert Parallelism (EP) - For MoE Models
+
+**Overview**: Distribute experts across GPUs, route tokens to appropriate GPUs.
+
+**How It Works**:
+- Each GPU handles subset of experts
+- All-to-all communication routes tokens to experts
+- Memory per GPU ≈ Model size / EP degree (for MoE layers)
+- Non-MoE layers replicated
+
+**Setup**:
+```bash
+# 8-way Expert Parallelism (for 8-expert MoE)
+torchrun --nproc_per_node=8 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/ckpt,ep_degree=8 \
+    --tasks hellaswag
+```
+
+**Pros**: Natural fit for MoE, reduces memory for expert layers
+**Cons**: All-to-all communication overhead
+**Best for**: MoE models with many experts
+
+---
+
+### 4. Hybrid TP+EP - Maximum Efficiency
+
+**Overview**: Combine Tensor Parallelism and Expert Parallelism for best of both.
+
+**How It Works**:
+- TP shards non-MoE layers (attention, FFN)
+- EP distributes experts across GPUs
+- 2D device mesh: (EP, TP)
+- Memory savings from both strategies
+
+**Setup**:
+```bash
+# 8 GPUs: 2-way TP × 4-way EP
+torchrun --nproc_per_node=8 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=3B,checkpoint_path=/path/to/ckpt,tp_degree=2,ep_degree=4,enable_ep_tp=True \
+    --tasks hellaswag
+```
+
+**Pros**: Maximum memory efficiency, supports very large MoE models
+**Cons**: Complex setup, highest communication overhead
+**Best for**: Very large MoE models
+
+---
 
 ### DCP Checkpoint Compatibility
 
-**Good news**: DCP checkpoints work seamlessly with data parallelism!
+**All parallelization strategies work seamlessly with DCP checkpoints!**
 
 - **DCP** handles checkpoint format and loading
-- **DDP** handles runtime parallelism
+- **Parallelism** handles runtime execution
 - They are orthogonal and compatible
-- Each GPU loads the full model from the (potentially sharded) DCP checkpoint
-- DCP automatically assembles sharded weights into the full model
+- DCP automatically handles:
+  - Loading sharded checkpoints
+  - Assembling weights for the target parallelism strategy
+  - Redistributing weights across the device mesh
+
+**Example**: Checkpoint saved with TP=8 can be loaded with:
+- Single GPU (DCP assembles full model)
+- TP=4 (DCP reshards to 4-way)
+- EP=8 (DCP loads full model, EP distributes experts)
+- TP=2, EP=4 (DCP handles both)
+
+---
+
+### Comparison Table
+
+| Strategy | Memory/GPU | Throughput | Communication | Setup Complexity | Best Use Case |
+|----------|------------|------------|---------------|------------------|---------------|
+| **DDP** | Full model | N× | Minimal | Easy | Throughput, small models |
+| **TP** | 1/N model | ~1× | High (all-reduce) | Medium | Large dense models |
+| **EP** | ~1/N MoE | ~1× | High (all-to-all) | Medium | MoE models |
+| **TP+EP** | 1/(TP×EP) MoE | ~1× | Very high | Complex | Very large MoE |
+
+---
 
 ### Performance Expectations
 
-| GPUs | Throughput Multiplier | Notes |
-|------|----------------------|-------|
-| 1 | 1x (baseline) | Single GPU evaluation |
-| 2 | ~2x | Linear scaling |
-| 4 | ~4x | Linear scaling |
-| 8 | ~8x | Linear scaling (if model fits) |
+#### Data Parallelism (DDP)
+| GPUs | Throughput | Memory/GPU | Example Model |
+|------|------------|------------|---------------|
+| 1 | 1× | 4 GB | 1B model |
+| 4 | 4× | 4 GB | 1B model |
+| 8 | 8× | 4 GB | 1B model |
 
-**Important**: Each GPU must have enough memory to hold the full model. For memory-efficient parallelism, use Tensor Parallelism (TP) instead.
+#### Tensor Parallelism (TP)
+| GPUs | Throughput | Memory/GPU | Example Model |
+|------|------------|------------|---------------|
+| 1 | 1× | 20 GB | 8B model |
+| 4 | ~1× | 5 GB | 8B model |
+| 8 | ~1× | 2.5 GB | 8B model |
 
-### Comparison: Data Parallelism vs Tensor Parallelism
+#### Expert Parallelism (EP)
+| GPUs | Throughput | Memory/GPU | Example Model |
+|------|------------|------------|---------------|
+| 1 | 1× | 8 GB | 1B MoE (8 experts) |
+| 4 | ~1× | 4 GB | 1B MoE (8 experts) |
+| 8 | ~1× | 2 GB | 1B MoE (8 experts) |
 
-| Feature | Data Parallelism (DDP) | Tensor Parallelism (TP) |
-|---------|------------------------|-------------------------|
-| **Memory per GPU** | Full model | 1/N of model |
-| **Throughput** | N× improvement | Similar to single GPU |
-| **Communication** | Minimal (results only) | High (activations) |
-| **Setup** | Easy (Accelerate) | Complex (device mesh) |
-| **Best for** | Throughput, small models | Large models, memory-bound |
-| **Currently Supported** | ✅ Yes | ❌ Not yet (planned) |
+---
+
+### Configuration Examples
+
+#### Small Model, High Throughput
+```bash
+# 1B model, 4 GPUs, maximize throughput
+accelerate launch --num_processes=4 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=1B,checkpoint_path=/path/to/ckpt \
+    --tasks hellaswag --batch_size 16
+```
+
+#### Large Model, Memory Constrained
+```bash
+# 8B model, 4 GPUs, reduce memory
+torchrun --nproc_per_node=4 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=8B,checkpoint_path=/path/to/ckpt,tp_degree=4 \
+    --tasks hellaswag --batch_size 4
+```
+
+#### Large MoE Model
+```bash
+# 3B MoE with 128 experts, 8 GPUs
+torchrun --nproc_per_node=8 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=3B,checkpoint_path=/path/to/ckpt,ep_degree=8 \
+    --tasks hellaswag --batch_size 8
+```
+
+#### Maximum Efficiency for Large MoE
+```bash
+# 8B MoE, 16 GPUs: 4-way TP, 4-way EP
+torchrun --nproc_per_node=16 \
+    -m lm_eval --model torchtitan \
+    --model_args model_name=llama3_moe,model_flavor=8B,checkpoint_path=/path/to/ckpt,tp_degree=4,ep_degree=4,enable_ep_tp=True \
+    --tasks hellaswag --batch_size 4
+```
 
 ## Performance Considerations
 
