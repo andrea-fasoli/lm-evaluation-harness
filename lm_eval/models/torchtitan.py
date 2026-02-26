@@ -406,6 +406,52 @@ class TorchTitanLM(TemplateLM):
 
         eval_logger.info(f"Model loaded successfully on {self._device}")
 
+        # Test forward pass with TP
+        if self.use_model_parallel and self.tp_degree > 1:
+            eval_logger.info(f"Rank {self._rank}: Testing forward pass with dummy input (short)...")
+            dummy_input = torch.randint(0, 100, (1, 10), device=self._device)
+            try:
+                with torch.no_grad():
+                    dummy_output = self._model(dummy_input)
+                eval_logger.info(f"Rank {self._rank}: Test forward pass (short) successful! Output shape: {dummy_output.shape if hasattr(dummy_output, 'shape') else type(dummy_output)}")
+            except Exception as e:
+                eval_logger.error(f"Rank {self._rank}: Test forward pass (short) FAILED: {e}")
+                raise
+
+            # Test with longer sequence similar to evaluation
+            eval_logger.info(f"Rank {self._rank}: Testing forward pass with dummy input (long, 140 tokens)...")
+            dummy_input_long = torch.randint(0, 100, (1, 140), device=self._device)
+            try:
+                with torch.no_grad():
+                    dummy_output_long = self._model(dummy_input_long)
+                eval_logger.info(f"Rank {self._rank}: Test forward pass (long) successful! Output shape: {dummy_output_long.shape if hasattr(dummy_output_long, 'shape') else type(dummy_output_long)}")
+            except Exception as e:
+                eval_logger.error(f"Rank {self._rank}: Test forward pass (long) FAILED: {e}")
+                raise
+
+            # Test with BOS token (128000) which appears in real data
+            eval_logger.info(f"Rank {self._rank}: Testing forward pass with BOS token (128000)...")
+            dummy_input_bos = torch.full((1, 140), 128000, dtype=torch.long, device=self._device)
+            try:
+                with torch.no_grad():
+                    dummy_output_bos = self._model(dummy_input_bos)
+                eval_logger.info(f"Rank {self._rank}: Test forward pass (BOS) successful! Output shape: {dummy_output_bos.shape if hasattr(dummy_output_bos, 'shape') else type(dummy_output_bos)}")
+            except Exception as e:
+                eval_logger.error(f"Rank {self._rank}: Test forward pass (BOS) FAILED: {e}")
+                raise
+
+            # Test with the EXACT token sequence that will be used in evaluation
+            eval_logger.info(f"Rank {self._rank}: Testing forward pass with real token sequence...")
+            real_tokens = torch.tensor([[128000, 41348, 25, 2650, 311, 636, 311, 23975, 587, 363, 13, 21603, 264, 2167, 11213, 311, 23975, 587, 12543, 17149]],
+                                      dtype=torch.long, device=self._device)
+            try:
+                with torch.no_grad():
+                    dummy_output_real = self._model(real_tokens)
+                eval_logger.info(f"Rank {self._rank}: Test forward pass (real tokens) successful! Output shape: {dummy_output_real.shape if hasattr(dummy_output_real, 'shape') else type(dummy_output_real)}")
+            except Exception as e:
+                eval_logger.error(f"Rank {self._rank}: Test forward pass (real tokens) FAILED: {e}")
+                raise
+
     def _apply_model_parallelism(self) -> None:
         """Apply TP/EP parallelism to the model using torchtitan functions."""
         eval_logger.info("Applying model parallelism...")
@@ -521,10 +567,61 @@ class TorchTitanLM(TemplateLM):
         Forward pass through TorchTitan model.
 
         TorchTitan models expect only input_ids (no attention_mask).
+
+        For Tensor Parallelism, the output logits will be a DTensor sharded
+        on the vocabulary dimension. They need to be gathered before use.
         """
-        with torch.no_grad():
+        if self.use_model_parallel and self.tp_degree > 1:
+            import threading
+            eval_logger.info(f"Rank {self._rank}: Calling self._model(inps), inps.shape={inps.shape}")
+            eval_logger.info(f"Rank {self._rank}: Thread ID: {threading.current_thread().ident}, Thread name: {threading.current_thread().name}")
+            eval_logger.info(f"Rank {self._rank}: torch.cuda.current_device()={torch.cuda.current_device()}")
+            eval_logger.info(f"Rank {self._rank}: Model device: {next(self._model.parameters()).device}")
+            eval_logger.info(f"Rank {self._rank}: Input device: {inps.device}")
+            eval_logger.info(f"Rank {self._rank}: Input token IDs (first 20): {inps[0, :20].tolist()}")
+            eval_logger.info(f"Rank {self._rank}: Input token IDs (last 20): {inps[0, -20:].tolist()}")
+            eval_logger.info(f"Rank {self._rank}: Unique token count: {len(torch.unique(inps))}, min={inps.min().item()}, max={inps.max().item()}")
+
+            # Force a barrier right before model call
+            eval_logger.info(f"Rank {self._rank}: Calling barrier before model forward...")
+            torch.distributed.barrier()
+            eval_logger.info(f"Rank {self._rank}: Barrier complete, now calling model...")
+            eval_logger.info(f"Rank {self._rank}: torch.is_grad_enabled()={torch.is_grad_enabled()}")
+            eval_logger.info(f"Rank {self._rank}: Model training mode={self._model.training}")
+
+        # Try calling model with explicit synchronization
+        try:
+            if self.use_model_parallel and self.tp_degree > 1:
+                eval_logger.info(f"Rank {self._rank}: About to call model with inps.shape={inps.shape}")
             logits = self._model(inps)
-            return logits
+            if self.use_model_parallel and self.tp_degree > 1:
+                eval_logger.info(f"Rank {self._rank}: Model call returned! inps.shape={inps.shape}, logits.shape={logits.shape}")
+        except Exception as e:
+            if self.use_model_parallel and self.tp_degree > 1:
+                eval_logger.error(f"Rank {self._rank}: Model call failed with exception: {e}")
+            raise
+
+        if self.use_model_parallel and self.tp_degree > 1:
+            eval_logger.info(f"Rank {self._rank}: Model returned logits, type={type(logits)}, shape={logits.shape if hasattr(logits, 'shape') else 'N/A'}")
+
+        # For Tensor Parallelism: gather sharded logits across TP ranks
+        if self.use_model_parallel and self.tp_degree > 1:
+            # The output layer with TP produces Shard(-1) (sharded on vocab dim)
+            # We need to all-gather to get the full vocabulary logits
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(logits, DTensor):
+                if self._rank == 0:
+                    eval_logger.info(f"Rank {self._rank}: logits is DTensor, calling full_tensor()")
+                # Convert DTensor to full tensor by gathering across TP mesh
+                logits = logits.full_tensor()
+                if self._rank == 0:
+                    eval_logger.info(f"Rank {self._rank}: full_tensor() complete, shape={logits.shape}")
+            else:
+                if self._rank == 0:
+                    eval_logger.info(f"Rank {self._rank}: logits is NOT DTensor, skipping gather")
+
+        return logits
 
     def _debug_test_generation(self):
         """
@@ -760,54 +857,137 @@ class TorchTitanLM(TemplateLM):
             batch_size = 1
         chunks = re_ord.get_batched(n=batch_size, batch_fn=None)
 
+        # For TP, only rank 0 should show progress bar
+        show_pbar = disable_tqdm or (self.use_model_parallel and self.tp_degree > 1 and self._rank != 0)
         pbar = tqdm(
             total=len(requests),
-            disable=disable_tqdm,
+            disable=show_pbar,
             desc="Running loglikelihood requests",
         )
 
-        for chunk in chunks:
-            inps = []
-            cont_toks_list = []
-            inplens = []
+        for chunk_idx, chunk in enumerate(chunks):
+            # Synchronize all ranks before processing each chunk (required for TP)
+            if self.use_model_parallel and self.tp_degree > 1:
+                eval_logger.info(f"Rank {self._rank}: Starting chunk {chunk_idx}, size={len(chunk)}")
+                torch.distributed.barrier()
+                eval_logger.info(f"Rank {self._rank}: Barrier passed for chunk {chunk_idx}")
 
-            padding_len_inp = None
+            # For TP: Only rank 0 builds the batch, then broadcasts to all ranks
+            if self.use_model_parallel and self.tp_degree > 1:
+                if self._rank == 0:
+                    # Rank 0 builds the batch
+                    inps = []
+                    cont_toks_list = []
+                    inplens = []
+                    padding_len_inp = None
 
-            for _, context_enc, continuation_enc in chunk:
-                # Sanity checks
-                assert len(context_enc) > 0
-                assert len(continuation_enc) > 0
-                assert len(continuation_enc) <= self.max_length
+                    for _, context_enc, continuation_enc in chunk:
+                        # Sanity checks
+                        assert len(context_enc) > 0
+                        assert len(continuation_enc) > 0
+                        assert len(continuation_enc) <= self.max_length
 
-                # Concatenate context and continuation, truncate from left if needed
-                inp = torch.tensor(
-                    (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
-                    dtype=torch.long,
-                    device=self.device,
+                        # Concatenate context and continuation, truncate from left if needed
+                        inp = torch.tensor(
+                            (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        (inplen,) = inp.shape
+
+                        padding_len_inp = (
+                            max(padding_len_inp, inplen)
+                            if padding_len_inp is not None
+                            else inplen
+                        )
+
+                        inps.append(inp)
+                        cont_toks_list.append(continuation_enc)
+                        inplens.append(inplen)
+
+                    # Pad and batch inputs
+                    assert padding_len_inp is not None, "padding_len_inp should not be None"
+                    batched_inps = pad_and_concat(
+                        padding_len_inp, inps, padding_side="right"
+                    )
+                    eval_logger.info(f"Rank {self._rank}: Built batch, shape={batched_inps.shape}")
+                else:
+                    # Other ranks: create placeholder with same shape as rank 0 will broadcast
+                    # We don't know the exact shape yet, so we'll receive it via broadcast
+                    # For now, create a dummy tensor that will be overwritten
+                    batched_inps = torch.empty(1, 1, dtype=torch.long, device=self.device)
+                    cont_toks_list = []
+                    inplens = []
+                    eval_logger.info(f"Rank {self._rank}: Waiting for broadcast from rank 0")
+
+                # Broadcast batch shape first
+                if self._rank == 0:
+                    shape_tensor = torch.tensor(list(batched_inps.shape), dtype=torch.long, device=self.device)
+                else:
+                    shape_tensor = torch.zeros(2, dtype=torch.long, device=self.device)
+                torch.distributed.broadcast(shape_tensor, src=0)
+
+                # Non-rank-0 processes create correctly-sized tensor
+                if self._rank != 0:
+                    batched_inps = torch.empty(tuple(shape_tensor.tolist()), dtype=torch.long, device=self.device)
+                    eval_logger.info(f"Rank {self._rank}: Created tensor with shape={batched_inps.shape}")
+
+                # Broadcast the actual data
+                eval_logger.info(f"Rank {self._rank}: Broadcasting inputs, shape={batched_inps.shape}")
+                torch.distributed.broadcast(batched_inps, src=0)
+                eval_logger.info(f"Rank {self._rank}: Broadcast complete")
+            else:
+                # Non-TP path: each rank builds its own batch
+                inps = []
+                cont_toks_list = []
+                inplens = []
+                padding_len_inp = None
+
+                for _, context_enc, continuation_enc in chunk:
+                    # Sanity checks
+                    assert len(context_enc) > 0
+                    assert len(continuation_enc) > 0
+                    assert len(continuation_enc) <= self.max_length
+
+                    # Concatenate context and continuation, truncate from left if needed
+                    inp = torch.tensor(
+                        (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    (inplen,) = inp.shape
+
+                    padding_len_inp = (
+                        max(padding_len_inp, inplen)
+                        if padding_len_inp is not None
+                        else inplen
+                    )
+
+                    inps.append(inp)
+                    cont_toks_list.append(continuation_enc)
+                    inplens.append(inplen)
+
+                # Pad and batch inputs
+                assert padding_len_inp is not None, "padding_len_inp should not be None"
+                batched_inps = pad_and_concat(
+                    padding_len_inp, inps, padding_side="right"
                 )
-                (inplen,) = inp.shape
-
-                padding_len_inp = (
-                    max(padding_len_inp, inplen)
-                    if padding_len_inp is not None
-                    else inplen
-                )
-
-                inps.append(inp)
-                cont_toks_list.append(continuation_enc)
-                inplens.append(inplen)
-
-            # Pad and batch inputs
-            # Ensure padding_len_inp is not None
-            assert padding_len_inp is not None, "padding_len_inp should not be None"
-            batched_inps = pad_and_concat(
-                padding_len_inp, inps, padding_side="right"
-            )
 
             # Get logits from model
+            if self.use_model_parallel and self.tp_degree > 1:
+                eval_logger.info(f"Rank {self._rank}: Calling model forward pass for chunk {chunk_idx}")
+
             with torch.no_grad():
                 logits = self._model_call(batched_inps)
+                # Note: _model_call now handles TP gathering internally
+
+                if self.use_model_parallel and self.tp_degree > 1:
+                    eval_logger.info(f"Rank {self._rank}: Model forward complete, computing log_softmax")
+
                 multi_logits = F.log_softmax(logits, dim=-1)
+
+                if self.use_model_parallel and self.tp_degree > 1 and self._rank == 0:
+                    eval_logger.info(f"Rank {self._rank}: log_softmax complete, processing results")
 
             # Process each request in the batch
             for (request_str, ctx_tokens, _), logits, inplen, cont_toks in zip(
@@ -837,6 +1017,10 @@ class TorchTitanLM(TemplateLM):
 
                 self.cache_hook.add_partial("loglikelihood", request_str, answer)
                 pbar.update(1)
+
+            # Synchronize all ranks after processing each chunk (required for TP)
+            if self.use_model_parallel and self.tp_degree > 1:
+                torch.distributed.barrier()
 
         pbar.close()
         return re_ord.get_original(res)
