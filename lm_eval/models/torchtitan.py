@@ -755,30 +755,66 @@ class TorchTitanLM(TemplateLM):
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         """
-        Generate text using simple greedy decoding. Implement
-        basic greedy generation.
-        """
-        # DEBUG: Test generation on first call
-        # if not hasattr(self, '_debug_test_done'):
-        #     self._debug_test_done = True
-        #     self._debug_test_generation()
+        Generate text using greedy decoding with KV cache for efficiency.
 
+        Prefill phase: run the full context through the model once to populate
+        the KV cache. Decode phase: run one new token at a time, reusing the
+        cached keys/values so each step is O(1) in compute rather than O(N).
+        """
         max_new_tokens = generation_kwargs.get("max_new_tokens", self.max_gen_toks)
         eos_token_id = self.tokenizer.eos_token_id
+        original_context_len = context.shape[1]
 
-        for _ in range(max_new_tokens):
+        # --- Prefill: process the full context, populate KV cache ---
+        with torch.no_grad():
+            prefill_out = self._model(context, past_key_values=[])
+            if isinstance(prefill_out, tuple):
+                logits, past_key_values = prefill_out
+            else:
+                # Model does not support KV cache (fallback to naive loop)
+                logits = prefill_out
+                past_key_values = None
+
+        if past_key_values is None:
+            # Fallback: naive full-context loop (no KV cache)
+            for _ in range(max_new_tokens):
+                with torch.no_grad():
+                    logits = self._model(context)
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                    context = torch.cat([context, next_token], dim=1)
+                    if next_token.item() == eos_token_id:
+                        break
+                    if stop:
+                        generated_tokens = context[0, original_context_len:]
+                        decoded = self.tokenizer.decode(generated_tokens)
+                        if any(stop_seq in decoded for stop_seq in stop):
+                            break
+            return context
+
+        # --- Decode: one token at a time, reusing KV cache ---
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        context = torch.cat([context, next_token], dim=1)
+
+        for _ in range(max_new_tokens - 1):
+            if next_token.item() == eos_token_id:
+                break
+            if stop:
+                generated_tokens = context[0, original_context_len:]
+                decoded = self.tokenizer.decode(generated_tokens)
+                if any(stop_seq in decoded for stop_seq in stop):
+                    break
+
             with torch.no_grad():
-                logits = self._model(context)
+                decode_out = self._model(next_token, past_key_values=past_key_values)
+                logits, past_key_values = decode_out
                 next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 context = torch.cat([context, next_token], dim=1)
 
-                if next_token.item() == eos_token_id:
-                    break
-
-                if stop:
-                    decoded = self.tokenizer.decode(context[0])
-                    if any(stop_seq in decoded for stop_seq in stop):
-                        break
+        # Check EOS/stop on the last generated token
+        if next_token.item() != eos_token_id and stop:
+            generated_tokens = context[0, original_context_len:]
+            decoded = self.tokenizer.decode(generated_tokens)
+            # Caller will handle stop-sequence trimming
 
         return context
 
