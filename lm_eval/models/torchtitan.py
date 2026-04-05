@@ -760,14 +760,25 @@ class TorchTitanLM(TemplateLM):
         Prefill phase: run the full context through the model once to populate
         the KV cache. Decode phase: run one new token at a time, reusing the
         cached keys/values so each step is O(1) in compute rather than O(N).
+
+        Args:
+            use_kv_cache: If False, use naive O(N²) generation without KV cache
         """
         max_new_tokens = generation_kwargs.get("max_new_tokens", self.max_gen_toks)
+        use_kv_cache = generation_kwargs.get("use_kv_cache", True)
         eos_token_id = self.tokenizer.eos_token_id
         original_context_len = context.shape[1]
 
         # --- Prefill: process the full context, populate KV cache ---
         with torch.no_grad():
-            prefill_out = self._model(context, past_key_values=[])
+            if use_kv_cache:
+                # Pass empty list to request KV cache creation (prefill phase)
+                # The model will populate and return KV caches for all layers
+                prefill_out = self._model(context, past_key_values=[])
+            else:
+                # Don't use KV cache - just get logits
+                prefill_out = self._model(context)
+
             if isinstance(prefill_out, tuple):
                 logits, past_key_values = prefill_out
             else:
@@ -1061,56 +1072,148 @@ class TorchTitanLM(TemplateLM):
         pbar.close()
         return re_ord.get_original(res)
 
-    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
+    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False, debug_max_requests: Optional[int] = None):
         """
         Compute log-likelihood for rolling window evaluation (for perplexity).
 
         This method processes long sequences by breaking them into overlapping windows
         and computing the log-likelihood for each window.
 
+        For EP (Expert Parallelism), all ranks must process the same number of iterations
+        to avoid deadlocks in collective operations. Shorter request lists are padded
+        with dummy requests to ensure synchronization.
+
         Args:
             requests: List of Instance objects with args=(string,)
             disable_tqdm: Whether to disable progress bar
+            debug_max_requests: If set, limit processing to this many requests (for debugging)
 
         Returns:
             List of total log-likelihoods for each request
         """
         from lm_eval import utils
 
+        # Debug mode: limit number of requests for troubleshooting
+        if debug_max_requests is not None and debug_max_requests > 0:
+            original_count = len(requests)
+            requests = requests[:debug_max_requests]
+            eval_logger.warning(
+                f"DEBUG MODE: Processing only {len(requests)}/{original_count} requests"
+            )
+
+        # Dummy request class for EP padding
+        class DummyRequest:
+            """Dummy request for EP padding to maintain collective operation alignment."""
+            def __init__(self):
+                self.args = ("",)  # Empty string
+                self.is_dummy = True
+
+        # For EP: pad request lists to ensure all ranks process same number of iterations
+        if self.use_model_parallel and self.ep_degree > 1:
+            # Gather request count from all ranks
+            local_req_count = torch.tensor([len(requests)], dtype=torch.long, device=self.device)
+            all_req_counts = [torch.zeros_like(local_req_count) for _ in range(self._world_size)]
+            torch.distributed.all_gather(all_req_counts, local_req_count)
+
+            # Get max request count across all ranks
+            max_req_count = max(count.item() for count in all_req_counts)
+            local_count = len(requests)
+
+            if self._rank == 0:
+                eval_logger.info(f"EP mode: Max requests across ranks: {max_req_count}")
+                eval_logger.info(f"EP mode: Requests per rank: {[c.item() for c in all_req_counts]}")
+
+            # Pad with dummy requests to match max count
+            num_padding = max_req_count - local_count
+            if num_padding > 0:
+                requests = list(requests) + [DummyRequest() for _ in range(num_padding)]
+                eval_logger.info(
+                    f"Rank {self._rank}: Padded {num_padding} dummy requests "
+                    f"({local_count} → {max_req_count}) for EP synchronization"
+                )
+
         loglikelihoods = []
 
-        for (string,) in tqdm(
-            [req.args for req in requests],
-            disable=disable_tqdm,
+        # Show progress only on rank 0 when using model parallelism
+        show_pbar = disable_tqdm or (self.use_model_parallel and self._rank != 0)
+
+        for req in tqdm(
+            requests,
+            disable=show_pbar,
             desc="Running loglikelihood_rolling",
         ):
-            # Tokenize the string
-            rolling_token_windows = list(
-                map(
-                    utils.make_disjoint_window,
-                    utils.get_rolling_token_windows(
-                        token_list=self.tok_encode(string),
-                        prefix_token=self.prefix_token_id,
-                        max_seq_len=self.max_length,
-                        context_len=1,
-                    ),
+            # Check if this is a dummy request
+            is_dummy = hasattr(req, 'is_dummy') and req.is_dummy
+
+            if is_dummy:
+                # For dummy requests: create minimal windows to participate in EP collectives
+                # Use a single token (EOS) to minimize computation
+                eos_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, 'eos_token_id') else 0
+                rolling_token_windows = [(None, [eos_id], [eos_id])]
+            else:
+                # Normal processing for real requests
+                (string,) = req.args
+
+                # Tokenize the string
+                rolling_token_windows = list(
+                    map(
+                        utils.make_disjoint_window,
+                        utils.get_rolling_token_windows(
+                            token_list=self.tok_encode(string),
+                            prefix_token=self.prefix_token_id,
+                            max_seq_len=self.max_length,
+                            context_len=1,
+                        ),
+                    )
                 )
-            )
 
-            # Process each window
-            rolling_token_windows = [(None,) + x for x in rolling_token_windows]
+                # Process each window
+                rolling_token_windows = [(None,) + x for x in rolling_token_windows]
 
-            # Compute log-likelihood for all windows
-            string_nll = self._loglikelihood_tokens(
-                rolling_token_windows,
-                disable_tqdm=True,
-            )
+                # For EP: synchronize window counts to ensure all ranks process same number of chunks
+                if self.use_model_parallel and self.ep_degree > 1:
+                    # Gather window counts from all ranks
+                    local_window_count = torch.tensor([len(rolling_token_windows)], dtype=torch.long, device=self.device)
+                    all_window_counts = [torch.zeros_like(local_window_count) for _ in range(self._world_size)]
+                    torch.distributed.all_gather(all_window_counts, local_window_count)
 
-            # Sum log-likelihoods across all windows
-            string_nll = sum(nll[0] for nll in string_nll)
-            loglikelihoods.append(string_nll)
+                    max_window_count = max(count.item() for count in all_window_counts)
+                    local_count = len(rolling_token_windows)
 
-            self.cache_hook.add_partial("loglikelihood_rolling", (string,), string_nll)
+                    # Pad windows to match max count across ranks
+                    if local_count < max_window_count:
+                        eos_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, 'eos_token_id') else 0
+                        num_padding = max_window_count - local_count
+                        # Add dummy windows (will be ignored in result aggregation)
+                        for _ in range(num_padding):
+                            rolling_token_windows.append((None, [eos_id], [eos_id]))
+
+                        if self._rank == 0:
+                            eval_logger.debug(
+                                f"Rank {self._rank}: Padded {num_padding} windows "
+                                f"({local_count} → {max_window_count}) for EP window synchronization"
+                            )
+
+                # All ranks call _loglikelihood_tokens (participates in EP collectives)
+                window_nlls = self._loglikelihood_tokens(
+                    rolling_token_windows,
+                    disable_tqdm=True,
+                )
+
+                # Only keep results for real requests
+                if not is_dummy:
+                    (string,) = req.args  # Extract string for caching
+                    # Sum log-likelihoods across all windows
+                    string_nll = sum(nll[0] for nll in window_nlls)
+                    loglikelihoods.append(string_nll)
+
+                    self.cache_hook.add_partial("loglikelihood_rolling", (string,), string_nll)
+
+        # Final synchronization barrier for EP to ensure all ranks complete together
+        if self.use_model_parallel and self.ep_degree > 1:
+            torch.distributed.barrier()
+            if self._rank == 0:
+                eval_logger.info(f"EP mode: All ranks completed loglikelihood_rolling")
 
         return loglikelihoods
 
