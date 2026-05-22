@@ -53,6 +53,8 @@ def compute_scores(gold_list, pred):
     # test for overlap (compute_f1)
     f1_sum = 0.0
     em_sum = 0.0
+    print("-"*60)
+    print(f"{gold_list}   {pred}")
     if len(gold_list) > 1:
         for i in range(len(gold_list)):
             gold_answers = gold_list[0:i] + gold_list[i + 1 :]

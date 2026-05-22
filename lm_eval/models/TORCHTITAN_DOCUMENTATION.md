@@ -21,7 +21,7 @@ TemplateLM (lm_eval.api.model)
     └── TorchTitanLM
 ```
 
-Unlike the HuggingFace integration (`huggingface.py`), `TorchTitanLM` does **not** inherit from `HFLM` because:
+`TorchTitanLM` does **not** inherit from `HFLM` (HF loader defined in `huggingface.py`) because:
 
 1. **Different Model Initialization**: TorchTitan uses meta device initialization + manual weight loading
 2. **Different Checkpoint Format**: DCP (Distributed Checkpoint Protocol) vs. safetensors
